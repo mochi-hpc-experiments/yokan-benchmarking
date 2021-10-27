@@ -1,0 +1,84 @@
+#!/bin/bash
+#COBALT -A radix-io
+#COBALT -n 2
+#COBALT -t 1:00:00
+#COBALT --mode script
+#COBALT -q debug-flat-quad
+
+set -eu
+# "HERE" is actually the parent directory
+HERE=`dirname "$0"`/..
+
+BEDROCK_LOG=_bedrock.log
+
+# prevents interference between MPI and Mochi (libfabric)
+# libraries when sharing GNI resources
+export MPICH_GNI_NDREG_ENTRIES=1024
+
+echo "Sourcing settings"
+source $HERE/settings.sh
+source $HERE/theta/settings.sh
+
+echo "Setting up spack"
+source $YOKAN_EXP_SPACK_LOCATION/share/spack/setup-env.sh
+
+echo "Activating env"
+spack env activate $YOKAN_EXP_SPACK_ENV
+
+echo "Setting up protection domain"
+apstat -P | grep $YOKAN_EXP_PDOMAIN || apmgr pdomain -c -u $YOKAN_EXP_PDOMAIN
+
+echo "Starting Bedrock"
+rm -f bedrock.log
+aprun -n 1 -N 1 -cc none -d 32 -p $YOKAN_EXP_PDOMAIN \
+      bedrock ofi+gni -c $YOKAN_BEDROCK_CONFIG > $BEDROCK_LOG 2>&1 &
+BEDROCK_PID=$!
+sleep 1
+
+function cleanup {
+  echo "Killing Bedrock"
+  kill $BEDROCK_PID
+  sleep 5
+  echo "Destroying protection domain"
+  apmgr pdomain -r -u $YOKAN_EXP_PDOMAIN
+}
+trap cleanup EXIT
+
+echo "Extracting database id and server address..."
+n=0
+while [ $n -lt 3 ]
+do
+    sleep 1
+    n=`cat $BEDROCK_LOG | wc -l`
+done
+DATABASE_ID=`awk 'FNR == 1 {print $7}' ${BEDROCK_LOG}`
+SERVER_ADDRESS=`awk 'FNR == 3 {print $9}' ${BEDROCK_LOG}`
+
+echo "Database id is ${DATABASE_ID}"
+echo "Server address is ${SERVER_ADDRESS}"
+
+declare -a ops=(put put_multi put_packed
+                get get_multi get_packed
+                length length_multi length_packed
+                exists exists_multi exists_packed
+                erase erase_multi erase_packed
+                list_keys list_keys_packed
+                list_keyvals list_keyvals_packed)
+
+for op in "${ops[@]}"
+do
+    echo "Starting $op benchmark"
+    aprun -n 1 -N 1 -cc none -d 32 -p $YOKAN_EXP_PDOMAIN \
+      yokan-benchmark \
+      -o $op \
+      -k 12,28 \
+      -v 64,128 \
+      -n 131072 \
+      -r 3 \
+      -b 128 \
+      --prefix llll \
+      --prefix-freq 50 \
+      -d $DATABASE_ID \
+      -a $SERVER_ADDRESS > _$op.log
+done
+
